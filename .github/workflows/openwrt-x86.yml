@@ -1,0 +1,298 @@
+# 代码
+name: OpenWrt-x86 Builder
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: v25.12.2
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  # 固件只发布到 Release：Release 附件不计入 Actions storage 配额。
+  # 原 upload-artifact 步骤已移除（私有仓库仅 500 MB 配额，单个固件包约 1.1 GB）。
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+  # --- 磁盘预算（72G 根分区） ---
+  # 历史教训：ccache 无上限 + tee 全量落盘，两者叠加把 72G 写满，
+  # runner 进程直接抛 Unhandled exception 崩溃（连 _diag 日志都写不进去）。
+  # 结论：彻底停用 ccache ——
+  #   1) 跨 run 缓存装不下（GitHub 每仓库限额 10GB，ccache 需 5~15GB）；
+  #   2) 轮内复用收益远小于它占用的数 GB 磁盘，而磁盘正是本项目的瓶颈。
+  # 省下的空间全部留给 build_dir。注意：还需删掉 .config 里的 CONFIG_CCACHE=y，
+  # 否则 make 仍会尝试走 ccache（CCACHE_DISABLE 仅在部分路径生效）。
+  CCACHE_DISABLE: 1
+  # 编译前要求的最小可用空间（GB）。
+  MIN_FREE_GB: 30
+  # 编译期间守护阈值：可用空间低于此值立即中止 make，避免 runner 崩溃。
+  GUARD_MIN_MB: 3072
+  # 预演时长（秒）：先跑一小段量出磁盘消耗速率，再决定是否值得全量编译。
+  REHEARSAL_SEC: 180
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install bzip2 g++ gawk gcc git glibc-source libncurses-dev make python3-pyelftools
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        # free-disk-space 之后仍有残留的大目录
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /usr/local/share/boost /usr/local/lib/node_modules \
+                    "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+        sudo apt-get -qq clean
+        echo "=========== 清理后根分区 ==========="
+        df -hT /
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: |
+        cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: |
+        cd openwrt && ./scripts/feeds install -a
+        # Go 工具链使用 ImmortalWrt 自带（feeds/packages/lang/golang，golang1.26 = go1.26.8）。
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Purge ccache leftovers
+      run: |
+        # 彻底停用 ccache：清掉可能由缓存或历史构建留下的 .ccache 目录。
+        # .config 里的 CONFIG_CCACHE 已注释掉，此处再兜底删一次，确保 make 不会写它。
+        rm -rf openwrt/.ccache /workdir/.ccache ~/.ccache
+        echo "ccache purge done: CCACHE_DISABLE=${CCACHE_DISABLE:-<unset>}"
+        du -sh openwrt/.ccache 2>/dev/null || echo "  .ccache absent (expected)"
+
+    - name: Clean Go module cache (avoid cross-build pollution)
+      run: |
+        rm -rf openwrt/dl/go-mod-cache
+        echo "Removed stale go-mod-cache"
+
+    - name: Pre-build space check
+      run: |
+        cd openwrt
+        # 清掉可能被磁盘写满截断的中间文件（残缺的 .files-packageinfo.mk 会让 make 直接崩）
+        rm -rf tmp/info tmp/.packageinfo tmp/.targetinfo tmp/.config-package.in tmp/.config-target.in
+        echo "--- /workdir 下占用最大的目录 ---"
+        du -sh /workdir/* 2>/dev/null | sort -rh | head -10 || true
+        echo "--- openwrt 关键目录 ---"
+        du -sh dl build_dir staging_dir 2>/dev/null || true
+        echo "--- 确认 ccache 已停用 ---"
+        grep -n 'CONFIG_CCACHE' .config || echo "  CONFIG_CCACHE 未启用（预期）"
+        du -sh .ccache 2>/dev/null || echo "  .ccache 不存在（预期）"
+        AVAIL=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+        echo "Available on /: ${AVAIL}G (need >= ${MIN_FREE_GB}G)"
+        df -hT /
+        if [ "${AVAIL:-0}" -lt "$MIN_FREE_GB" ]; then
+          echo "::error::磁盘可用空间仅 ${AVAIL}G，低于 ${MIN_FREE_GB}G，编译必然中途写满。"
+          exit 1
+        fi
+
+    - name: Disk rehearsal (measure consumption rate)
+      run: |
+        cd openwrt
+        # 预演：只编译一小段，量出磁盘消耗速率，据此判断 72G 是否够用。
+        # 避免再赌一次 3.5 小时。
+        avail_mb() { df --output=avail -BM / | tail -1 | tr -dc '0-9'; }
+        # 兜底：取不到值时给 0，避免算术展开失败把 step 直接搞挂
+        BEFORE=$(avail_mb); BEFORE=${BEFORE:-0}
+        echo "rehearsal start: ${BEFORE}M available"
+        set +e
+        timeout "${REHEARSAL_SEC}s" make -j$(nproc) > /workdir/rehearsal.log 2>&1
+        RC=$?
+        set -e
+        [ "$RC" -eq 124 ] && echo "预演按时中止（timeout，预期行为）" || echo "预演提前退出 rc=$RC"
+        # 预演失败不给整个 job 判死：这里只做测量
+        AFTER=$(avail_mb); AFTER=${AFTER:-0}
+        echo "=========================================="
+        echo "预演 ${REHEARSAL_SEC}s  起始可用: ${BEFORE}M  结束可用: ${AFTER}M"
+        USED=$((BEFORE - AFTER))
+        echo "净消耗: ${USED}M"
+        echo "=========================================="
+        if [ "$USED" -gt 0 ]; then
+          RATE=$((USED / REHEARSAL_SEC))
+          echo "消耗速率约 ${RATE}M/s ($((RATE * 60))M/min)"
+          EST=$((RATE * 60 * 200))
+          echo "按 200 分钟估算全程追加消耗: $((EST / 1024))G"
+          AVAIL_NOW=$(avail_mb); AVAIL_NOW=${AVAIL_NOW:-0}
+          if [ "$EST" -ge "$AVAIL_NOW" ]; then
+            echo "::warning::按此速率，全程消耗 $((EST / 1024))G >= 当前可用 $((AVAIL_NOW / 1024))G，72G 可能不够。"
+            echo "::warning::建议精简 .config（去掉 docker/dockerd/openclash/lucky 等大包）后重跑。"
+          else
+            echo "空间充足：全程预计消耗 $((EST / 1024))G < 可用 $((AVAIL_NOW / 1024))G"
+          fi
+        else
+          echo "该阶段未产生净消耗（多为下载/解包阶段，属正常）"
+        fi
+        echo "--- 当前占用 ---"
+        du -sh dl build_dir staging_dir 2>/dev/null || true
+        df -hT /
+        rm -f /workdir/rehearsal.log
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        echo "ccache disabled: CCACHE_DISABLE=${CCACHE_DISABLE:-<unset>}"
+
+        # 磁盘守护：每 60s 检查，可用空间 < 阈值就杀掉 make。
+        # 关键：守护输出实时打印（不重定向），这样即使 runner 崩溃，
+        # 也能在 GitHub 页面的 step 日志里看到崩溃前的空间曲线。
+        GUARD_LOG=/workdir/guard.log
+        : > "$GUARD_LOG"
+        ( while true; do
+            sleep 60
+            AV=$(df --output=avail -BM / | tail -1 | tr -dc '0-9'); AV=${AV:-0}
+            echo "[guard] $(date -u +%H:%M:%S) avail=${AV}M"
+            echo "$(date -u +%H:%M:%S) avail=${AV}M" >> "$GUARD_LOG"
+            if [ "$AV" -lt "${GUARD_MIN_MB}" ]; then
+              echo "::error::磁盘剩余 ${AV}M < ${GUARD_MIN_MB}M，中止编译以防 runner 崩溃"
+              pkill -9 -f 'make' 2>/dev/null || true
+              exit 1
+            fi
+          done ) &
+        GUARD=$!
+
+        # 不使用 tee：避免把数十 GB 编译输出全量落盘与 build_dir 抢空间。
+        # 输出直接进 step 日志，由 GitHub 托管（不占工作盘）。
+        # 也不再串联 `|| make -j1 || make -j1 V=s` 重试：磁盘满时重试只会放大损害。
+        set +e
+        make -j$(nproc)
+        RC=$?
+        set -e
+
+        kill "$GUARD" 2>/dev/null || true
+        # 不强 wait：守护可能正卡在 sleep，wait 会白等最多 60s 且可能返回非 0
+        echo "=========== 编译期间磁盘曲线（最后 20 条）==========="
+        tail -20 "$GUARD_LOG" 2>/dev/null || true
+        df -hT /
+
+        if [ "$RC" -ne 0 ]; then
+          echo "::error::make 退出码 $RC"
+          exit "$RC"
+        fi
+
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Show build error tail
+      if: failure()
+      run: |
+        echo "=========== df -hT ==========="
+        df -hT || true
+        echo "=========== openwrt 目录占用 ==========="
+        du -sh /workdir/openwrt/dl /workdir/openwrt/build_dir /workdir/openwrt/staging_dir 2>/dev/null || true
+        echo "=========== .config 设备行 ==========="
+        grep -E '^CONFIG_TARGET' /workdir/openwrt/.config | head -20 || true
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: |
+        df -hT
+        du -sh /workdir/openwrt/dl /workdir/openwrt/build_dir /workdir/openwrt/staging_dir 2>/dev/null || true
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && success()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && success()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      # 用 !cancelled() 而非 success()：失败的 run 同样要清理。
+      # 之前用 success() 导致失败 run 全部堆积（如 9/16 三连失败）。
+      # 注意：runner 进程崩溃时本步骤不会执行（该场景靠定时清理兜底）。
+      if: (!cancelled())
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

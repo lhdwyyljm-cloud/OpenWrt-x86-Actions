@@ -1,0 +1,5 @@
+#!/bin/sh
+# 设置 LuCI 默认语言为简体中文（lang 值匹配 lmo 文件名 zh-cn）
+uci -q set luci.main.lang=zh-cn
+uci -q commit luci
+exit 0
