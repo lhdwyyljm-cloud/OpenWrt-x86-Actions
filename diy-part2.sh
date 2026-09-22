@@ -191,6 +191,11 @@ else
 	echo "[zh] SKIP luci-app-openclash 未启用（已从 .config 移除），无需处理"
 fi
 echo "[zh] $( [ -d "$_onliner/po/zh_Hans" ] && echo 'OK  ' || echo 'WARN') luci-app-onliner po/zh_Hans"
-echo "[zh] $( [ -f "$_agh/po/zh_Hans/adguardhome.po" ] && echo 'OK  ' || echo 'WARN') luci-app-adguardhome po/zh_Hans/adguardhome.po"
+# luci-app-adguardhome 已从 .config 移除（同 openclash），find 不到属正常，输出 SKIP。
+if [ -n "$_agh" ]; then
+	echo "[zh] $( [ -f "$_agh/po/zh_Hans/adguardhome.po" ] && echo 'OK  ' || echo 'WARN') luci-app-adguardhome po/zh_Hans/adguardhome.po"
+else
+	echo "[zh] SKIP luci-app-adguardhome 未启用（已从 .config 移除），无需处理"
+fi
 
 chmod +x files/usr/libexec/rpcd/luci.argon_wallpaper 2>/dev/null || true
