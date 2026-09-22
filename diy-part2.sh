@@ -180,13 +180,15 @@ AGH_PO_EOF
 fi
 
 # --- 自检：构建日志里直接可见中文就位情况 ---
+# 注：luci-app-openclash 已从 .config 移除，此时 find 不到属正常，输出 SKIP 而非 WARN。
+#     若日后重新启用 openclash，这段自检会自动恢复为 OK/FAIL 判定。
 _oc="$(_find_app luci-app-openclash)"
 if [ -n "$_oc" ] && [ -d "$_oc/po/zh-cn" ]; then
 	echo "[zh] OK   luci-app-openclash po/zh-cn 保持原样（自带 po2lmo，中文编在主包里）"
 elif [ -n "$_oc" ]; then
 	echo "[zh] FAIL luci-app-openclash 的 po/zh-cn 不见了 —— 改名会让主包 install 的 *.*.lmo 落空！"
 else
-	echo "[zh] WARN 找不到 luci-app-openclash"
+	echo "[zh] SKIP luci-app-openclash 未启用（已从 .config 移除），无需处理"
 fi
 echo "[zh] $( [ -d "$_onliner/po/zh_Hans" ] && echo 'OK  ' || echo 'WARN') luci-app-onliner po/zh_Hans"
 echo "[zh] $( [ -f "$_agh/po/zh_Hans/adguardhome.po" ] && echo 'OK  ' || echo 'WARN') luci-app-adguardhome po/zh_Hans/adguardhome.po"
