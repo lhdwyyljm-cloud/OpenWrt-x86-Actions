@@ -199,3 +199,5 @@ else
 fi
 
 chmod +x files/usr/libexec/rpcd/luci.argon_wallpaper 2>/dev/null || true
+sed -i 's/192.168.1.1/192.168.0.1/g' package/base-files/files/etc/config/network
+sed -i 's/root:::0:99999:7:::/root:$1$V4UetPzk$KYY.IoFfjfStgFiqA3.K1.:0:99999:7:::/g' package/base-files/files/etc/shadow
