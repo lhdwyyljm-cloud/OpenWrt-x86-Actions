@@ -110,17 +110,7 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    - name: Preinstall Open-Box
-      # 在 feeds install 之后、make defconfig 之前执行。
-      # Open-Box 以预编译 tar.gz 分发（无 Makefile、无法 feeds install），
-      # 这里下载并按官方 installer 的路径落进 openwrt/files/ 覆盖层，
-      # 由 OpenWrt 打包进 rootfs，刷机后开箱即用。
-      run: |
-        chmod +x $DIY_P3_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P3_SH
-
-    - name: Download package
+   - name: Download package
       id: package
       run: |
         cd openwrt
